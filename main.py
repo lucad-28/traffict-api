@@ -1,11 +1,13 @@
 import pandas as pd
 import re
+import networkx as nx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict, Optional
 import numpy as np
 import joblib
 import tensorflow
+from math import radians, sin, cos, sqrt, atan2
 load_model = tensorflow.keras.models.load_model
 LSTM = tensorflow.keras.layers.LSTM
 CustomObjectScope = tensorflow.keras.utils.CustomObjectScope
@@ -22,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # URL de tu Next.js
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -280,6 +282,353 @@ def get_station_by_id(station_id: int):
     
     return station.to_dict('records')[0]
 
+class RouteRequest(BaseModel):
+    """Request para buscar rutas alternativas"""
+    origin_station: int = Field(..., description="ID de estación origen")
+    destination_station: int = Field(..., description="ID de estación destino")
+    current_predictions: Dict[int, float] = Field(
+        ..., 
+        description="Diccionario con predicciones SPI actuales {station_id: spi_value}"
+    )
+    num_routes: int = Field(default=3, ge=1, le=5, description="Número de rutas alternativas (1-5)")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "origin_station": 400001,
+                "destination_station": 400050,
+                "current_predictions": {
+                    400001: 85.5,
+                    400002: 45.2,
+                    400003: 60.8,
+                    400050: 75.3
+                },
+                "num_routes": 3
+            }
+        }
+
+class RouteInfo(BaseModel):
+    """Información detallada de una ruta"""
+    route_id: int
+    route_name: str
+    stations: List[int]
+    num_stations: int
+    total_time_minutes: float
+    total_distance_km: float
+    avg_spi: float
+    min_spi: float
+    congested_segments: int
+    total_segments: int
+    congestion_percentage: float
+    status: str
+
+class RouteResponse(BaseModel):
+    """Respuesta con rutas sugeridas"""
+    origin: Dict[str, float]
+    destination: Dict[str, float]
+    routes: List[RouteInfo]
+    recommendation: str
+    graph_stats: Optional[Dict[str, int]] = None
+
+def haversine_distance(coord1, coord2):
+    """Calcula distancia en km entre dos coordenadas (lat, lon)"""
+    lat1, lon1 = radians(coord1[0]), radians(coord1[1])
+    lat2, lon2 = radians(coord2[0]), radians(coord2[1])
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    
+    R = 6371
+    return R * c
+
+
+def find_connected_stations(station, stations_df, max_distance_km=5):
+    """Encuentra estaciones conectadas (mismo freeway y dirección, cercanas)"""
+    candidates = stations_df[
+        (stations_df['Fwy'] == station['Fwy']) &
+        (stations_df['Dir'] == station['Dir']) &
+        (stations_df['ID'] != station['ID'])
+    ]
+    
+    connected = []
+    for _, candidate in candidates.iterrows():
+        dist = haversine_distance(
+            (station['Latitude'], station['Longitude']),
+            (candidate['Latitude'], candidate['Longitude'])
+        )
+        
+        if dist <= max_distance_km:
+            connected.append({
+                'id': candidate['ID'],
+                'distance': dist,
+                'lat': candidate['Latitude'],
+                'lon': candidate['Longitude']
+            })
+    
+    return connected
+
+
+def get_congestion_level_label(spi):
+    """Clasifica nivel de congestión según SPI"""
+    if spi >= 75:
+        return "fluido"
+    elif spi >= 50:
+        return "moderado"
+    elif spi >= 25:
+        return "congestionado"
+    else:
+        return "severo"
+
+
+def build_traffic_graph(stations_df, spi_predictions):
+    """
+    Construye grafo dirigido con estaciones como nodos y segmentos como aristas
+    Peso = tiempo estimado basado en distancia y SPI predicho
+    """
+    G = nx.DiGraph()
+
+    # OPTIMIZACIÓN: Solo usar estaciones que tienen predicciones SPI
+    relevant_station_ids = set(spi_predictions.keys())
+    relevant_stations_df = stations_df[stations_df['ID'].isin(relevant_station_ids)]
+
+    print(f"🔧 Construyendo grafo con {len(relevant_stations_df)} estaciones (de {len(stations_df)} totales)")
+
+    # Agregar nodos solo para estaciones relevantes
+    for _, station in relevant_stations_df.iterrows():
+        G.add_node(
+            station['ID'],
+            lat=station['Latitude'],
+            lon=station['Longitude'],
+            fwy=station['Fwy'],
+            direction=station['Dir']
+        )
+
+    # Agregar aristas solo entre estaciones relevantes
+    for _, station in relevant_stations_df.iterrows():
+        connected = find_connected_stations(station, relevant_stations_df)
+
+        for next_station in connected:
+            next_id = next_station['id']
+            distance = next_station['distance']
+
+            spi = spi_predictions.get(next_id, 50)
+
+            # Calcular peso (tiempo estimado)
+            speed_factor = max(0.1, spi / 100)
+            travel_time = distance / speed_factor
+
+            G.add_edge(
+                station['ID'],
+                next_id,
+                weight=travel_time,
+                distance=distance,
+                spi=spi,
+                congestion_level=get_congestion_level_label(spi)
+            )
+
+    print(f"✅ Grafo construido: {G.number_of_nodes()} nodos, {G.number_of_edges()} aristas")
+
+    return G
+
+
+def calculate_route_metrics(path, graph):
+    """Calcula métricas detalladas de una ruta"""
+    total_time = 0
+    total_distance = 0
+    spi_values = []
+    congested_count = 0
+    
+    for i in range(len(path) - 1):
+        edge = graph[path[i]][path[i+1]]
+        
+        total_time += edge['weight']
+        total_distance += edge['distance']
+        spi = edge['spi']
+        spi_values.append(spi)
+        
+        if spi < 50:
+            congested_count += 1
+    
+    return {
+        'time': total_time,
+        'distance': total_distance,
+        'avg_spi': np.mean(spi_values) if spi_values else 50,
+        'min_spi': min(spi_values) if spi_values else 50,
+        'congested': congested_count
+    }
+
+
+def get_route_status(avg_spi):
+    """Clasifica status general de la ruta"""
+    if avg_spi >= 75:
+        return "excellent"
+    elif avg_spi >= 60:
+        return "good"
+    elif avg_spi >= 40:
+        return "moderate"
+    else:
+        return "congested"
+
+
+def generate_recommendation(routes):
+    """Genera recomendación inteligente basada en las rutas"""
+    if not routes:
+        return "No hay rutas disponibles"
+    
+    best_route = routes[0]
+    
+    if best_route['avg_spi'] < 40 and len(routes) > 1:
+        alternative = routes[1]
+        time_diff = alternative['total_time_minutes'] - best_route['total_time_minutes']
+        
+        if time_diff < 5 and alternative['avg_spi'] > best_route['avg_spi'] + 10:
+            return (f"⚠️ Ruta principal congestionada (SPI {best_route['avg_spi']:.1f}). "
+                   f"Se recomienda Alternativa 1: solo {time_diff:.1f} min más "
+                   f"pero con mejor flujo (SPI {alternative['avg_spi']:.1f})")
+    
+    if best_route['avg_spi'] >= 60:
+        return f"✅ Ruta óptima con buen flujo de tráfico (SPI {best_route['avg_spi']:.1f})"
+    
+    return f"⚡ Ruta con tráfico moderado (SPI {best_route['avg_spi']:.1f}). Considere horarios alternativos."
+
+
+def find_optimal_routes_dijkstra(origin_id, dest_id, stations_df, spi_predictions, k=3):
+    """
+    Encuentra las k mejores rutas entre origen y destino usando Dijkstra
+    """
+    import time
+    start_time = time.time()
+
+    G = build_traffic_graph(stations_df, spi_predictions)
+    print(f"⏱️ Grafo construido en {time.time() - start_time:.2f}s")
+
+    if origin_id not in G or dest_id not in G:
+        return {
+            "error": "Estación origen o destino no encontrada en el grafo",
+            "origin": origin_id,
+            "destination": dest_id
+        }
+
+    try:
+        path_start = time.time()
+        best_path = nx.shortest_path(G, origin_id, dest_id, weight='weight')
+        best_time = nx.shortest_path_length(G, origin_id, dest_id, weight='weight')
+        print(f"⏱️ Ruta óptima encontrada en {time.time() - path_start:.2f}s")
+    except nx.NetworkXNoPath:
+        return {
+            "error": "No existe ruta entre origen y destino",
+            "origin": origin_id,
+            "destination": dest_id
+        }
+
+    try:
+        alt_start = time.time()
+        # OPTIMIZACIÓN: Usar iterador y limitar a k rutas con timeout
+        all_paths = []
+        path_generator = nx.shortest_simple_paths(G, origin_id, dest_id, weight='weight')
+
+        for i, path in enumerate(path_generator):
+            if i >= k:  # Solo obtener k rutas
+                break
+            all_paths.append(path)
+
+        print(f"⏱️ {len(all_paths)} rutas alternativas encontradas en {time.time() - alt_start:.2f}s")
+    except nx.NetworkXNoPath:
+        all_paths = [best_path]
+
+    paths_to_analyze = all_paths
+    
+    routes = []
+    for i, path in enumerate(paths_to_analyze):
+        metrics = calculate_route_metrics(path, G)
+        
+        routes.append({
+            "route_id": i + 1,
+            "route_name": "Ruta Óptima" if i == 0 else f"Alternativa {i}",
+            "stations": path,
+            "num_stations": len(path),
+            "total_time_minutes": round(metrics['time'], 2),
+            "total_distance_km": round(metrics['distance'], 2),
+            "avg_spi": round(metrics['avg_spi'], 1),
+            "min_spi": round(metrics['min_spi'], 1),
+            "congested_segments": metrics['congested'],
+            "total_segments": len(path) - 1,
+            "congestion_percentage": round((metrics['congested'] / max(1, len(path) - 1)) * 100, 1),
+            "status": get_route_status(metrics['avg_spi'])
+        })
+    
+    recommendation = generate_recommendation(routes)
+    
+    return {
+        "origin": {
+            "station_id": origin_id,
+            "current_spi": spi_predictions.get(origin_id, 50)
+        },
+        "destination": {
+            "station_id": dest_id,
+            "current_spi": spi_predictions.get(dest_id, 50)
+        },
+        "routes": routes,
+        "recommendation": recommendation,
+        "graph_stats": {
+            "nodes": G.number_of_nodes(),
+            "edges": G.number_of_edges()
+        }
+    }
+
+@app.post("/routes/suggest", response_model=RouteResponse)
+def suggest_alternative_routes(request: RouteRequest):
+    """
+    Encuentra rutas alternativas óptimas usando algoritmo de Dijkstra
+    
+    **Input**:
+    - origin_station: ID de estación origen
+    - destination_station: ID de estación destino  
+    - current_predictions: Diccionario con SPI predicho para cada estación
+    - num_routes: Número de rutas alternativas a devolver (1-5)
+    
+    **Output**:
+    - Rutas ordenadas por tiempo estimado
+    - Métricas detalladas (tiempo, distancia, SPI promedio)
+    - Recomendación inteligente
+    """
+    
+    if df_stations is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Metadata de estaciones no disponible"
+        )
+    
+    try:
+        result = find_optimal_routes_dijkstra(
+            origin_id=request.origin_station,
+            dest_id=request.destination_station,
+            stations_df=df_stations,
+            spi_predictions=request.current_predictions,
+            k=request.num_routes
+        )
+        
+        if "error" in result:
+            raise HTTPException(
+                status_code=404,
+                detail=result["error"]
+            )
+        
+        return RouteResponse(**result)
+        
+    except nx.NetworkXError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error en el grafo de rutas: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al calcular rutas: {str(e)}"
+        )
 
 if __name__ == "__main__":
     # Ejecutar servidor
