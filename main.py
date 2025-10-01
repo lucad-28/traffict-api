@@ -1,9 +1,14 @@
+import pandas as pd
+import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
 import numpy as np
 import joblib
-from tensorflow.keras.models import load_model
+import tensorflow
+load_model = tensorflow.keras.models.load_model
+LSTM = tensorflow.keras.layers.LSTM
+CustomObjectScope = tensorflow.keras.utils.CustomObjectScope
 import uvicorn
 
 # Inicializar FastAPI
@@ -13,10 +18,30 @@ app = FastAPI(
     version="1.0.0"
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # URL de tu Next.js
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Cargar modelo y scalers al iniciar
 print("Cargando modelo y scalers...")
 try:
-    modelo = load_model('modelo_lstm_trafico_final.keras')
+    # Usar CustomObjectScope para evitar problemas con argumentos deprecados
+    custom_objects = {}
+    modelo = load_model(
+        'modelo_lstm_trafico_final.h5',
+        custom_objects=custom_objects,
+        compile=False
+    )
+
+    # Recompilar
+    modelo.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
     scaler_X = joblib.load('scaler_X.pkl')
     scaler_y = joblib.load('scaler_y.pkl')
     print("✅ Modelo y scalers cargados exitosamente")
@@ -26,7 +51,14 @@ except Exception as e:
     scaler_X = None
     scaler_y = None
 
-
+print("Cargando metadata de estaciones...")
+try:
+    df_stations = pd.read_pickle('df_stations_necesario.pkl')
+    print(f"✅ Metadata cargado: {len(df_stations)} estaciones")
+except Exception as e:
+    print(f"❌ Error cargando metadata: {e}")
+    df_stations = None
+    
 # Modelo de datos para la entrada
 class TrafficSequence(BaseModel):
     """
@@ -143,13 +175,10 @@ def predict_spi(data: TrafficSequence):
         X_input = np.array(data.sequence)  # Shape: (12, 7)
         
         # Normalizar
-        X_scaled = scaler_X.transform(X_input)  # Shape: (12, 7)
-        
-        # Reshape para el modelo: (1, 12, 7)
-        X_model = X_scaled.reshape(1, 12, 7)
+        X_scaled = scaler_X.transform(X_input.reshape(-1, 7)).reshape(1, 12, 7)  # Shape: (12, 7)
         
         # Predicción
-        y_pred_scaled = modelo.predict(X_model, verbose=0)
+        y_pred_scaled = modelo.predict(X_scaled, verbose=0)
         
         # Desnormalizar
         spi_predicted = scaler_y.inverse_transform(y_pred_scaled)[0][0]
@@ -177,6 +206,79 @@ def predict_spi(data: TrafficSequence):
             status_code=500,
             detail=f"Error en la predicción: {str(e)}"
         )
+    
+class StationInfo(BaseModel):
+    ID: int
+    Fwy: int
+    Dir: str
+    District: int
+    County: float
+    City: float
+    State_PM: float
+    Abs_PM: float
+    Latitude: float
+    Longitude: float
+    Type: str
+    Lanes: int
+    Name: str
+
+class StationsResponse(BaseModel):
+    total: int
+    stations: List[StationInfo]
+
+def clean_postmile(value):
+    if isinstance(value, str):
+        # quita letras iniciales, conserva solo el número
+        match = re.search(r"[\d\.]+", value)
+        if match:
+            return float(match.group())
+        return 0.0
+    return float(value)
+
+# Endpoint para obtener todas las estaciones
+@app.get("/stations", response_model=StationsResponse)
+def get_stations():
+    """Devuelve información de todas las estaciones disponibles"""
+    
+    if df_stations is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Metadata de estaciones no disponible"
+        )
+    df_clean = df_stations.copy()
+    df_clean["State_PM"] = df_clean["State_PM"].apply(clean_postmile)
+    df_clean["Abs_PM"] = df_clean["Abs_PM"].apply(clean_postmile)
+    df_clean = df_clean.replace([float('inf'), float('-inf')], pd.NA)
+    df_clean = df_clean.dropna(subset=["Latitude", "Longitude"])
+    df_clean = df_clean.replace([float('inf'), float('-inf')], 0.0).fillna(0.0)
+    df_clean = df_clean[df_clean["Type"].isin(["ML", "HV"])]
+    stations_list = df_clean.to_dict('records')
+    
+    return StationsResponse(
+        total=len(stations_list),
+        stations=stations_list
+    )
+
+# Endpoint para obtener una estación específica
+@app.get("/stations/{station_id}", response_model=StationInfo)
+def get_station_by_id(station_id: int):
+    """Devuelve información de una estación específica por ID"""
+    
+    if df_stations is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Metadata de estaciones no disponible"
+        )
+    
+    station = df_stations[df_stations['ID'] == station_id]
+    
+    if station.empty:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Estación {station_id} no encontrada"
+        )
+    
+    return station.to_dict('records')[0]
 
 
 if __name__ == "__main__":
